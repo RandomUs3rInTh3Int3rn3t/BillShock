@@ -95,8 +95,10 @@ def get_system_context() -> str:
         "5. Provide complete, well-structured, helpful answers using bullet points and clean Discord markdown.",
         "6. Use Philippine Peso (₱) for all currency values.",
         "7. Format numbers with `inline code` (e.g. `₱15.1869/kWh`, `1000W`).",
+        "8. For any URLs or links, format them with clean descriptive titles like `[DOE PELP Portal](https://pelp.doe.gov.ph)` or `<https://pelp.doe.gov.ph>`. NEVER put full `https://...` raw URLs inside square brackets like `[https://...](https://...)`.",
         "=== END RULES ==="
     ]
+
     
     # Inject condensed rate data
     if os.path.exists(RATES_JSON_PATH):
@@ -222,8 +224,26 @@ def fetch_historical_context(query: str) -> str:
     return "\n".join(context_parts)
 
 
+def fix_discord_links(text: str) -> str:
+    """Sanitize and fix raw URL markdown like [https://url](https://url) to make them cleanly clickable in Discord embeds."""
+    if not text:
+        return text
+
+    def clean_link(match):
+        label = match.group(1).strip()
+        url = match.group(2).strip()
+        if label.startswith("http://") or label.startswith("https://"):
+            clean_label = re.sub(r'^https?://(www\.)?', '', label).rstrip('/')
+            if not clean_label:
+                clean_label = "Official Link"
+            return f"[{clean_label}]({url})"
+        return f"[{label}]({url})"
+
+    return re.sub(r'\[(https?://[^\s\]]+)\]\((https?://[^\s\)]+)\)', clean_link, text)
+
+
 async def ask_gemini_chatbot(user_query: str) -> str:
-    """Send prompt to Gemini AI with smart historical data injection."""
+    """Send prompt to Gemini AI with smart historical data injection and link sanitization."""
     if not GEMINI_API_KEY:
         return (
             "⚠️ **AI Assistant Offline**\n"
@@ -250,13 +270,14 @@ async def ask_gemini_chatbot(user_query: str) -> str:
             response = await asyncio.to_thread(model.generate_content, full_prompt)
             text = (response.text or "").strip()
             if text:
-                return text
+                return fix_discord_links(text)
         except Exception as e:
             last_error = e
             logger.warning(f"Gemini model {model_name} failed: {e}. Trying next...")
 
     logger.error(f"All Gemini models failed: {last_error}")
     return "⚠️ AI Assistant is temporarily busy or rate-limited. Please try again in a few seconds, or use `/rates` and `/calculate` for quick lookups!"
+
 
 
 
