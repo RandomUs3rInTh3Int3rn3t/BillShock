@@ -30,7 +30,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Setup Gemini AI Chatbot
 gemini_model = None
-selected_model_name = "gemini-2.0-flash"
+selected_model_name = "gemini-3.6-flash"
 
 if GEMINI_API_KEY:
     try:
@@ -38,7 +38,7 @@ if GEMINI_API_KEY:
         genai.configure(api_key=GEMINI_API_KEY)
         
         # Priority order of valid standard Gemini models for current API
-        candidate_models = ["gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-flash-latest", "gemini-3.6-flash", "gemini-pro-latest"]
+        candidate_models = ["gemini-3.6-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-flash-latest", "gemini-pro-latest"]
 
         
         try:
@@ -56,8 +56,9 @@ if GEMINI_API_KEY:
                 if available:
                     selected_model_name = available[0]
         except Exception as list_err:
-            logger.warning(f"Could not list models via API: {list_err}. Defaulting to gemini-2.0-flash")
-            selected_model_name = "gemini-2.0-flash"
+            logger.warning(f"Could not list models via API: {list_err}. Defaulting to gemini-3.6-flash")
+            selected_model_name = "gemini-3.6-flash"
+
 
         gemini_model = genai.GenerativeModel(selected_model_name)
         logger.info(f"Successfully initialized Gemini AI model: {selected_model_name}")
@@ -145,27 +146,20 @@ async def ask_gemini_chatbot(user_query: str) -> str:
 
     import google.generativeai as genai
 
-    fallback_models = [selected_model_name, "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-flash-latest", "gemini-3.6-flash"]
+    fallback_models = [selected_model_name, "gemini-3.6-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-flash-latest"]
     
     last_error = None
     for model_name in dict.fromkeys(fallback_models):
         try:
             model = genai.GenerativeModel(model_name)
-            # Call without max_output_tokens limiter so complete responses are generated
             response = await asyncio.to_thread(model.generate_content, full_prompt)
             text = (response.text or "").strip()
-            if not text:
-                continue
-
-            # Sanitize any dangling incomplete markdown lines at the end if truncated by Discord
-            if len(text) > 1900:
-                text = text[:1900] + "...\n*(truncated for Discord character limit)*"
-
             if text:
                 return text
         except Exception as e:
             last_error = e
             logger.warning(f"Gemini model {model_name} failed: {e}. Trying next...")
+
 
     logger.error(f"All Gemini models failed: {last_error}")
     return "⚠️ AI Assistant is temporarily busy or rate-limited. Please try again in a few seconds, or use `/rates` and `/calculate` for quick lookups!"
@@ -880,6 +874,98 @@ async def total_bill(
 
 
 # ==============================================================================
+# DISCORD LIMITS ADAPTATION & INTERACTIVE PAGINATOR
+# ==============================================================================
+
+def chunk_text_by_paragraphs(text: str, max_chars: int = 3800) -> List[str]:
+    """
+    Intelligently splits long text into chunks at paragraph/bullet boundaries.
+    Complies with Discord's Embed.description limit (4096 chars).
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    paragraphs = text.split("\n")
+    chunks = []
+    current_chunk = []
+    current_len = 0
+
+    for p in paragraphs:
+        if len(p) > max_chars:
+            if current_chunk:
+                chunks.append("\n".join(current_chunk).strip())
+                current_chunk = []
+                current_len = 0
+            for i in range(0, len(p), max_chars - 100):
+                chunks.append(p[i : i + max_chars - 100])
+            continue
+
+        if current_len + len(p) + 1 > max_chars:
+            chunks.append("\n".join(current_chunk).strip())
+            current_chunk = [p]
+            current_len = len(p)
+        else:
+            current_chunk.append(p)
+            current_len += len(p) + 1
+
+    if current_chunk:
+        chunks.append("\n".join(current_chunk).strip())
+
+    return [c for c in chunks if c]
+
+
+class AIPaginatorView(discord.ui.View):
+    """Interactive Discord UI View with Prev/Next buttons for multi-page AI responses."""
+
+    def __init__(self, pages: List[str], author_id: int, title: str = "⚡ BillShock AI • Electricity Assistant"):
+        super().__init__(timeout=300)
+        self.pages = pages
+        self.author_id = author_id
+        self.current_page = 0
+        self.title = title
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.prev_button.disabled = (self.current_page == 0)
+        self.next_button.disabled = (self.current_page == len(self.pages) - 1)
+        self.page_indicator.label = f"Page {self.current_page + 1}/{len(self.pages)}"
+
+    def build_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title=self.title,
+            description=self.pages[self.current_page],
+            color=COLOR_BLUE
+        )
+        embed.set_footer(text=f"BillShock AI ⚡ • Page {self.current_page + 1} of {len(self.pages)} • Ask via /ask or @mention")
+        return embed
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, custom_id="prev_page")
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Only the person who asked can use page buttons.", ephemeral=True)
+            return
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Page 1/1", style=discord.ButtonStyle.primary, disabled=True, custom_id="page_indicator")
+    async def page_indicator(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pass
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary, custom_id="next_page")
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Only the person who asked can use page buttons.", ephemeral=True)
+            return
+        if self.current_page < len(self.pages) - 1:
+            self.current_page += 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+
+# ==============================================================================
 # AI CHATBOT COMMAND & EVENT HANDLERS
 # ==============================================================================
 
@@ -890,13 +976,18 @@ async def ask_command(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)
     response_text = await ask_gemini_chatbot(question)
 
-    embed = discord.Embed(
-        title="⚡ BillShock AI • Electricity Assistant",
-        description=response_text,
-        color=COLOR_BLUE
-    )
-    embed.set_footer(text="BillShock AI ⚡ • Ask questions via /ask or @mention")
-    await interaction.followup.send(embed=embed)
+    pages = chunk_text_by_paragraphs(response_text, max_chars=3800)
+    if len(pages) == 1:
+        embed = discord.Embed(
+            title="⚡ BillShock AI • Electricity Assistant",
+            description=pages[0],
+            color=COLOR_BLUE
+        )
+        embed.set_footer(text="BillShock AI ⚡ • Ask questions via /ask or @mention")
+        await interaction.followup.send(embed=embed)
+    else:
+        view = AIPaginatorView(pages=pages, author_id=interaction.user.id)
+        await interaction.followup.send(embed=view.build_embed(), view=view)
 
 
 @bot.event
@@ -930,15 +1021,22 @@ async def on_message(message: discord.Message):
         async with message.channel.typing():
             ai_reply = await ask_gemini_chatbot(clean_text)
             
-        embed = discord.Embed(
-            title="⚡ BillShock AI • Electricity Assistant",
-            description=ai_reply,
-            color=COLOR_BLUE
-        )
-        embed.set_footer(text="BillShock AI ⚡ • Ask questions via /ask or @mention")
-        await message.reply(embed=embed)
+        pages = chunk_text_by_paragraphs(ai_reply, max_chars=3800)
+        if len(pages) == 1:
+            embed = discord.Embed(
+                title="⚡ BillShock AI • Electricity Assistant",
+                description=pages[0],
+                color=COLOR_BLUE
+            )
+            embed.set_footer(text="BillShock AI ⚡ • Ask questions via /ask or @mention")
+            await message.reply(embed=embed)
+        else:
+            view = AIPaginatorView(pages=pages, author_id=message.author.id)
+            await message.reply(embed=view.build_embed(), view=view)
 
     await bot.process_commands(message)
+
+
 
 
 
