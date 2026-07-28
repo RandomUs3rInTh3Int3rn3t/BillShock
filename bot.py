@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import calendar
+import asyncio
 from typing import List, Optional
 import discord
 from discord import app_commands
@@ -20,13 +21,95 @@ logger = logging.getLogger("meralco_bot")
 load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ALLOWED_CHANNEL_ID = os.getenv("ALLOWED_CHANNEL_ID")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Setup Bot Client
+# Setup Bot Client with message content intent
 intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Setup Gemini AI Chatbot
+gemini_model = None
+if GEMINI_API_KEY:
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        for model_name in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-pro"]:
+            try:
+                gemini_model = genai.GenerativeModel(model_name)
+                logger.info(f"Successfully initialized Gemini AI model: {model_name}")
+                break
+            except Exception:
+                continue
+    except ImportError:
+        logger.warning("google-generativeai package not installed. Install via requirements.txt.")
+    except Exception as e:
+        logger.error(f"Error initializing Gemini AI: {e}")
+
+def get_system_context() -> str:
+    """Build system context using current rates and appliance database (RAG)."""
+    context_lines = [
+        "You are BillShock AI, an expert, friendly assistant for Meralco electricity bills, appliance power usage, and energy-saving advice in the Philippines.",
+        "Use Philippine Peso (₱ / PHP) for currency.",
+        "Provide clear, helpful, concise answers formatted cleanly with Discord markdown (bold, bullet points, code blocks where helpful)."
+    ]
+    
+    if os.path.exists(RATES_JSON_PATH):
+        try:
+            with open(RATES_JSON_PATH, "r", encoding="utf-8") as f:
+                rates_data = json.load(f)
+                if rates_data.get("success") and rates_data.get("data"):
+                    context_lines.append("\n--- Live Meralco Rates Data ---")
+                    if rates_data.get("date"):
+                        context_lines.append(f"Billing Period: {rates_data['date']}")
+                    for entry in rates_data["data"]:
+                        context_lines.append(
+                            f"- {entry['kwh']} kWh bracket: ₱{entry['rate']:.4f}/kWh (Generation: ₱{entry['generation_rate']:.4f}/kWh)"
+                        )
+        except Exception:
+            pass
+
+    appliance_db_path = os.path.join(os.path.dirname(__file__), "appliance_db.json")
+    if os.path.exists(appliance_db_path):
+        try:
+            with open(appliance_db_path, "r", encoding="utf-8") as f:
+                app_data = json.load(f)
+                appliances = app_data.get("appliances", [])
+                if appliances:
+                    context_lines.append("\n--- Appliance Wattages Database (Sample) ---")
+                    for app in appliances[:15]:
+                        context_lines.append(
+                            f"- {app['name']}: ~{app['average_wattage']}W ({app['wattage_range']}) - {app.get('description', '')}"
+                        )
+        except Exception:
+            pass
+
+    return "\n".join(context_lines)
+
+async def ask_gemini_chatbot(user_query: str) -> str:
+    """Send prompt to Gemini AI and return formatted response."""
+    if not gemini_model:
+        return (
+            "⚠️ **AI Assistant Offline**\n"
+            "The AI Chatbot requires `GEMINI_API_KEY` to be set in your `.env` or Render environment variables."
+        )
+
+    system_context = get_system_context()
+    full_prompt = f"{system_context}\n\nUser Question: {user_query}\n\nAnswer:"
+
+    try:
+        response = await asyncio.to_thread(gemini_model.generate_content, full_prompt)
+        text = response.text.strip()
+        if len(text) > 1900:
+            text = text[:1900] + "...\n*(response truncated due to Discord length limit)*"
+        return text
+    except Exception as e:
+        logger.error(f"Gemini API query error: {e}")
+        return f"❌ Error contacting AI Assistant: `{str(e)}`"
 
 # Channel limitation check
 def is_allowed_channel():
+
     def predicate(interaction: discord.Interaction) -> bool:
         if not ALLOWED_CHANNEL_ID:
             return True  # If not set, allow all channels
@@ -718,6 +801,58 @@ async def total_bill(
         embed.add_field(name="⚠️ Note", value=rates_info["warning"], inline=False)
 
     await interaction.followup.send(embed=embed)
+
+
+# ==============================================================================
+# AI CHATBOT COMMAND & EVENT HANDLERS
+# ==============================================================================
+
+@bot.tree.command(name="ask", description="Ask BillShock AI anything about Meralco rates, appliances, or energy saving.")
+@app_commands.describe(question="Your question about electricity, bills, appliances, or rates")
+@is_allowed_channel()
+async def ask_command(interaction: discord.Interaction, question: str):
+    await interaction.response.defer(thinking=True)
+    response_text = await ask_gemini_chatbot(question)
+
+    embed = discord.Embed(
+        title="🤖 BillShock AI Assistant",
+        description=response_text,
+        color=MERALCO_ORANGE
+    )
+    embed.set_footer(text="Ask me anything using /ask <question> or by @mentioning me!")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Ignore messages sent by bots
+    if message.author.bot:
+        return
+
+    # Check if channel restriction applies
+    if ALLOWED_CHANNEL_ID:
+        try:
+            if message.channel.id != int(ALLOWED_CHANNEL_ID):
+                return
+        except (ValueError, TypeError):
+            pass
+
+    # Check if the bot was mentioned in the message
+    if bot.user in message.mentions:
+        # Strip out the mention tag to get pure query text
+        clean_text = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
+        if not clean_text:
+            await message.reply("Hello! 👋 I'm **BillShock AI**. Ask me anything about Meralco rates, appliance costs, or energy saving tips!")
+            return
+
+        async with message.channel.typing():
+            ai_reply = await ask_gemini_chatbot(clean_text)
+            
+        await message.reply(ai_reply)
+
+    await bot.process_commands(message)
+
+
 
 
 

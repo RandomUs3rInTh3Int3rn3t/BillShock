@@ -28,6 +28,7 @@ The calculator provides a real-time, dynamic breakdown of your Meralco electrici
 The Discord bot provides slash commands for rates checking, appliance wattage database queries, and bill calculations.
 
 ### Commands
+* `/ask <question>`: Chat with **BillShock AI** about Meralco rates, appliance power usage, or energy saving tips (or mention `@BillShock`).
 * `/rates`: View the latest Meralco residential rates per consumption bracket.
 * `/bracket <kwh>`: Save your typical monthly consumption bracket to personalize calculations.
 * `/calculate <appliance_or_wattage> <hours_per_day> [days]`: Estimate the cost of running a specific appliance.
@@ -36,6 +37,7 @@ The Discord bot provides slash commands for rates checking, appliance wattage da
 * `/total_bill <kwh> [generation_rate] [other_charges]`: Calculate a fully itemized monthly bill estimate.
 * `/generation_charge <kwh>`: Estimate base generation charge.
 * `/update_rates`: Force check and update the Meralco rate PDF cache.
+
 
 ### Installation & Setup
 
