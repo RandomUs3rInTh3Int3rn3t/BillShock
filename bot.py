@@ -11,7 +11,8 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 # Import our rate parser module
-from meralco_parser import get_meralco_rates, RATES_JSON_PATH
+from meralco_parser import get_meralco_rates, get_rates_for_specific_month, RATES_JSON_PATH
+from datetime import datetime as dt
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -133,8 +134,93 @@ def get_system_context() -> str:
     return _cached_system_context
 
 
+def detect_historical_query(query: str) -> list[tuple[int, int]]:
+    """
+    Detect month/year references in natural language queries.
+    Returns list of (year, month) tuples found in the query.
+    Handles formats like:
+      - 'May 2025', 'may 2025'
+      - 'January 2024', 'jan 2024'
+      - '05/2025', '5/2025'
+      - 'last month', 'previous month'
+      - 'rates in 2024' (returns all 12 months — capped to latest available)
+    """
+    results = []
+    now = dt.now()
+
+    # Pattern: month name + year (e.g. 'May 2025', 'jan 2024', 'December 2023')
+    month_names = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
+    month_abbr = {m.lower(): i for i, m in enumerate(calendar.month_abbr) if m}
+    all_months = {**month_names, **month_abbr}
+
+    for pattern in [
+        r'\b(' + '|'.join(all_months.keys()) + r')\s+(\d{4})\b',
+        r'\b(\d{4})\s+(' + '|'.join(all_months.keys()) + r')\b',
+    ]:
+        for match in re.finditer(pattern, query.lower()):
+            groups = match.groups()
+            if groups[0].isdigit():
+                year, month_str = int(groups[0]), groups[1]
+            else:
+                month_str, year = groups[0], int(groups[1])
+            month_num = all_months.get(month_str)
+            if month_num and 2020 <= year <= now.year:
+                results.append((year, month_num))
+
+    # Pattern: MM/YYYY or M/YYYY
+    for match in re.finditer(r'\b(\d{1,2})/(\d{4})\b', query):
+        m, y = int(match.group(1)), int(match.group(2))
+        if 1 <= m <= 12 and 2020 <= y <= now.year:
+            results.append((y, m))
+
+    # Pattern: 'last month', 'previous month'
+    if re.search(r'\b(last|previous|prev)\s+month\b', query.lower()):
+        from dateutil.relativedelta import relativedelta
+        prev = now - relativedelta(months=1)
+        results.append((prev.year, prev.month))
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for item in results:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
+
+
+def fetch_historical_context(query: str) -> str:
+    """Detect historical date references and fetch rate data to inject into AI context."""
+    dates_found = detect_historical_query(query)
+    if not dates_found:
+        return ""
+
+    context_parts = []
+    for year, month in dates_found[:3]:  # Cap at 3 months to avoid huge prompts
+        try:
+            result = get_rates_for_specific_month(year, month)
+            if result.get("success") and result.get("data"):
+                month_name = calendar.month_name[month]
+                context_parts.append(f"\n[Historical Rates — {month_name} {year}]")
+                context_parts.append(f"Billing Period: {result.get('date', 'N/A')}")
+                for entry in result["data"]:
+                    trend_str = ""
+                    if entry.get("rate_change"):
+                        trend_str = f" (MoM: {entry['rate_change']:+.4f}/kWh, {entry.get('trend', '')})"
+                    context_parts.append(
+                        f"{entry['kwh']}kWh: ₱{entry['rate']:.4f}/kWh (gen: ₱{entry['generation_rate']:.4f}){trend_str}"
+                    )
+            else:
+                month_name = calendar.month_name[month]
+                context_parts.append(f"\n[Historical Rates — {month_name} {year}]: Not available. The official PDF for this period was not found.")
+        except Exception as e:
+            logger.warning(f"Failed to fetch historical rates for {month}/{year}: {e}")
+
+    return "\n".join(context_parts)
+
+
 async def ask_gemini_chatbot(user_query: str) -> str:
-    """Send prompt to Gemini AI without token limiters."""
+    """Send prompt to Gemini AI with smart historical data injection."""
     if not GEMINI_API_KEY:
         return (
             "⚠️ **AI Assistant Offline**\n"
@@ -142,6 +228,12 @@ async def ask_gemini_chatbot(user_query: str) -> str:
         )
 
     system_context = get_system_context()
+
+    # Smart historical data injection: detect month/year references and fetch real data
+    historical_context = await asyncio.to_thread(fetch_historical_context, user_query)
+    if historical_context:
+        system_context += f"\n\n{historical_context}\n\nIMPORTANT: Use the historical rates data above to answer the user's question accurately. Cite the exact figures."
+
     full_prompt = f"{system_context}\n\nUser: {user_query}\n\nAnswer:"
 
     import google.generativeai as genai
@@ -159,7 +251,6 @@ async def ask_gemini_chatbot(user_query: str) -> str:
         except Exception as e:
             last_error = e
             logger.warning(f"Gemini model {model_name} failed: {e}. Trying next...")
-
 
     logger.error(f"All Gemini models failed: {last_error}")
     return "⚠️ AI Assistant is temporarily busy or rate-limited. Please try again in a few seconds, or use `/rates` and `/calculate` for quick lookups!"
@@ -887,6 +978,81 @@ async def total_bill(
     if rates_info.get("warning"):
         embed.add_field(name="⚠️ Note", value=rates_info["warning"], inline=False)
 
+    await interaction.followup.send(embed=embed)
+
+
+# ==============================================================================
+# HISTORICAL RATES COMMAND
+# ==============================================================================
+
+MONTH_CHOICES = [
+    app_commands.Choice(name=calendar.month_name[i], value=i)
+    for i in range(1, 13)
+]
+
+@bot.tree.command(name="historical_rates", description="Look up official Meralco residential rates from any past month.")
+@app_commands.describe(
+    month="Month to look up (1-12 or select from list)",
+    year="Year to look up (e.g. 2024, 2025)"
+)
+@app_commands.choices(month=MONTH_CHOICES)
+@is_allowed_channel()
+async def historical_rates(interaction: discord.Interaction, month: app_commands.Choice[int], year: int):
+    now = dt.now()
+    if year < 2020 or year > now.year:
+        await interaction.response.send_message(f"❌ Year must be between 2020 and {now.year}.", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    rates_info = await asyncio.to_thread(get_rates_for_specific_month, year, month.value)
+
+    if not rates_info.get("success"):
+        await interaction.followup.send(
+            f"❌ Could not retrieve rates for **{month.name} {year}**. The official Meralco PDF for this month may not be available yet."
+        )
+        return
+
+    billing_date = rates_info.get("date", f"{month.name} {year}")
+    data_list = rates_info.get("data", [])
+    source_url = rates_info.get("meta", {}).get("source", "https://www.meralco.com.ph")
+
+    embed = discord.Embed(
+        title=f"📜 Historical Meralco Rates — {billing_date}",
+        description=f"Official residential electricity rates for **{month.name} {year}** (VAT-exclusive).",
+        url=source_url,
+        color=COLOR_CYAN
+    )
+
+    # Highlight 200 kWh baseline bracket
+    typical_entry = next((item for item in data_list if item["kwh"] == 200), None)
+    if typical_entry:
+        trend_emoji = "📈" if typical_entry.get("trend") == "up" else "📉" if typical_entry.get("trend") == "down" else "➡️"
+        change_text = f"`{typical_entry['rate_change']:+.4f}` PHP/kWh MoM" if typical_entry.get('rate_change') else "No prior data"
+        embed.add_field(
+            name="💡 Baseline Household (200 kWh)",
+            value=f"• **Effective Rate:** `₱{typical_entry['rate']:.4f} / kWh`\n"
+                  f"• **Gen Rate:** `₱{typical_entry['generation_rate']:.4f} / kWh`\n"
+                  f"• **MoM Trend:** {trend_emoji} {change_text}",
+            inline=False
+        )
+
+    # Show other brackets
+    brackets_to_show = [50, 100, 300, 500, 1000]
+    bracket_lines = []
+    for entry in data_list:
+        if entry["kwh"] in brackets_to_show:
+            trend_icon = "🔺" if entry.get("trend") == "up" else "🔻" if entry.get("trend") == "down" else "🔹"
+            bracket_lines.append(f"• **{entry['kwh']} kWh:** `₱{entry['rate']:.4f}/kWh` {trend_icon}")
+
+    if bracket_lines:
+        embed.add_field(
+            name="📊 Other Brackets",
+            value="\n".join(bracket_lines),
+            inline=False
+        )
+
+    embed.set_footer(text=f"BillShock ⚡ • Historical rates from official Meralco bulletins")
     await interaction.followup.send(embed=embed)
 
 

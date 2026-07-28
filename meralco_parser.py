@@ -301,6 +301,49 @@ def get_meralco_rates() -> MeralcoRatesResult:
 
     return result
 
+
+def get_rates_for_specific_month(year: int, month: int) -> MeralcoRatesResult:
+    """Fetch and parse Meralco rates for a specific month/year."""
+    meta = {
+        "timestamp": datetime.now().isoformat(),
+        "source": None,
+    }
+
+    target_date = datetime(year, month, 1)
+    target_url = get_pdf_url(target_date)
+    target_bytes = download_pdf(target_url)
+    target_parsed = parse_single_month(target_bytes) if target_bytes else None
+
+    if not target_parsed:
+        return {
+            "success": False,
+            "error": f"Could not retrieve rates for {calendar.month_name[month]} {year}. The PDF may not exist.",
+            "warning": None,
+            "date": None,
+            "data": None,
+            "meta": meta,
+        }
+
+    # Fetch previous month for MoM comparison
+    prev_date = target_date - relativedelta(months=1)
+    prev_url = get_pdf_url(prev_date)
+    prev_bytes = download_pdf(prev_url)
+    prev_parsed = parse_single_month(prev_bytes) if prev_bytes else None
+    prev_entries = prev_parsed["entries"] if prev_parsed else None
+
+    entries_with_changes = compute_rate_changes(target_parsed["entries"], prev_entries)
+    meta["source"] = target_url
+
+    return {
+        "success": True,
+        "error": None,
+        "warning": None,
+        "date": target_parsed["billing_date"],
+        "data": entries_with_changes,
+        "meta": meta,
+    }
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     print("Testing Meralco PDF Rates Parser...")
