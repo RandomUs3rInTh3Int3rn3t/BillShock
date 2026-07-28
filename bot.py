@@ -200,10 +200,17 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 async def on_ready():
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     try:
-        synced = await bot.tree.sync()
-        logger.info(f"Successfully synced {len(synced)} slash commands across all servers: {[cmd.name for cmd in synced]}")
+        # Copy and sync commands to connected guilds for instant availability (bypasses Discord 1-hour global cache delay)
+        for guild in bot.guilds:
+            bot.tree.copy_global_to(guild=guild)
+            synced_guild = await bot.tree.sync(guild=guild)
+            logger.info(f"Synced {len(synced_guild)} slash commands to guild '{guild.name}' ({guild.id})")
+
+        global_synced = await bot.tree.sync()
+        logger.info(f"Successfully synced {len(global_synced)} global slash commands: {[cmd.name for cmd in global_synced]}")
     except Exception as e:
         logger.error(f"Failed to sync slash commands: {e}")
+
 
 # File paths
 
