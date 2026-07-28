@@ -30,21 +30,43 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Setup Gemini AI Chatbot
 gemini_model = None
+selected_model_name = "gemini-2.0-flash"
+
 if GEMINI_API_KEY:
     try:
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
-        for model_name in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-pro"]:
-            try:
-                gemini_model = genai.GenerativeModel(model_name)
-                logger.info(f"Successfully initialized Gemini AI model: {model_name}")
-                break
-            except Exception:
-                continue
+        
+        # Priority order of valid standard Gemini models for current API
+        candidate_models = ["gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-flash-latest", "gemini-3.6-flash", "gemini-pro-latest"]
+
+        
+        try:
+            available = [
+                m.name.replace("models/", "") 
+                for m in genai.list_models() 
+                if "generateContent" in m.supported_generation_methods
+            ]
+            logger.info(f"Available Gemini models: {available}")
+            for cand in candidate_models:
+                if cand in available:
+                    selected_model_name = cand
+                    break
+            else:
+                if available:
+                    selected_model_name = available[0]
+        except Exception as list_err:
+            logger.warning(f"Could not list models via API: {list_err}. Defaulting to gemini-2.0-flash")
+            selected_model_name = "gemini-2.0-flash"
+
+        gemini_model = genai.GenerativeModel(selected_model_name)
+        logger.info(f"Successfully initialized Gemini AI model: {selected_model_name}")
     except ImportError:
         logger.warning("google-generativeai package not installed. Install via requirements.txt.")
     except Exception as e:
         logger.error(f"Error initializing Gemini AI: {e}")
+
+
 
 def get_system_context() -> str:
     """Build system context using current rates and appliance database (RAG)."""
@@ -87,8 +109,8 @@ def get_system_context() -> str:
     return "\n".join(context_lines)
 
 async def ask_gemini_chatbot(user_query: str) -> str:
-    """Send prompt to Gemini AI and return formatted response."""
-    if not gemini_model:
+    """Send prompt to Gemini AI and return formatted response with model fallback."""
+    if not GEMINI_API_KEY:
         return (
             "⚠️ **AI Assistant Offline**\n"
             "The AI Chatbot requires `GEMINI_API_KEY` to be set in your `.env` or Render environment variables."
@@ -97,15 +119,27 @@ async def ask_gemini_chatbot(user_query: str) -> str:
     system_context = get_system_context()
     full_prompt = f"{system_context}\n\nUser Question: {user_query}\n\nAnswer:"
 
-    try:
-        response = await asyncio.to_thread(gemini_model.generate_content, full_prompt)
-        text = response.text.strip()
-        if len(text) > 1900:
-            text = text[:1900] + "...\n*(response truncated due to Discord length limit)*"
-        return text
-    except Exception as e:
-        logger.error(f"Gemini API query error: {e}")
-        return f"❌ Error contacting AI Assistant: `{str(e)}`"
+    import google.generativeai as genai
+    fallback_models = [selected_model_name, "gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-flash-latest", "gemini-3.6-flash", "gemini-pro-latest"]
+
+    
+    last_error = None
+
+    for model_name in dict.fromkeys(fallback_models):
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = await asyncio.to_thread(model.generate_content, full_prompt)
+            text = response.text.strip()
+            if len(text) > 1900:
+                text = text[:1900] + "...\n*(response truncated due to Discord length limit)*"
+            return text
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Gemini API model {model_name} failed: {e}. Trying next model...")
+
+    logger.error(f"Gemini API query error across all models: {last_error}")
+    return f"❌ Error contacting AI Assistant: `{str(last_error)}`"
+
 
 # Channel limitation check
 def is_allowed_channel():
