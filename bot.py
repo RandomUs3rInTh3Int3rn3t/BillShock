@@ -721,9 +721,35 @@ async def total_bill(
 
 
 
+# Lightweight HTTP Health Server for Render Free Tier Web Service
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"BillShock Discord Bot is running!")
+
+    def log_message(self, format, *args):
+        pass  # Suppress web server logs from polluting bot logs
+
+def run_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        logger.info(f"Health check HTTP server started on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Failed to start health server: {e}")
+
 # Start Bot
 if __name__ == "__main__":
     if not TOKEN:
         print("❌ Error: DISCORD_BOT_TOKEN environment variable not set in .env")
     else:
+        # Start dummy HTTP health check server for Render Web Service compliance
+        threading.Thread(target=run_health_server, daemon=True).start()
         bot.run(TOKEN)
+
