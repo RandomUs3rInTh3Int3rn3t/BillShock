@@ -4,15 +4,18 @@ import logging
 import re
 import calendar
 import asyncio
+import time
+import requests
 from typing import List, Optional
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 # Import our rate parser module
 from meralco_parser import get_meralco_rates, get_rates_for_specific_month, RATES_JSON_PATH
 from datetime import datetime as dt
+
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -301,6 +304,8 @@ async def on_ready():
         logger.info(f"Successfully synced {len(global_synced)} global slash commands: {[cmd.name for cmd in global_synced]}")
     except Exception as e:
         logger.error(f"Failed to sync slash commands: {e}")
+
+
 
 
 # File paths
@@ -1054,6 +1059,103 @@ async def historical_rates(interaction: discord.Interaction, month: app_commands
 
     embed.set_footer(text=f"BillShock ⚡ • Historical rates from official Meralco bulletins")
     await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="ping", description="Check bot latency and test Render response.")
+@is_allowed_channel()
+async def ping(interaction: discord.Interaction):
+    ws_latency = round(bot.latency * 1000)
+    render_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_PING_URL")
+    http_status = "N/A"
+    http_time = "N/A"
+
+    if render_url:
+        try:
+            t0 = time.time()
+            resp = await asyncio.to_thread(requests.get, render_url, timeout=5)
+            t1 = time.time()
+            http_status = f"{resp.status_code} OK" if resp.status_code == 200 else f"HTTP {resp.status_code}"
+            http_time = f"{round((t1 - t0) * 1000)} ms"
+        except Exception:
+            http_status = "Ping Failed"
+
+    embed = discord.Embed(
+        title="🏓 Bot Status & Ping",
+        color=COLOR_GREEN
+    )
+    embed.add_field(name="🟢 Status", value="`Online & Active`", inline=True)
+    embed.add_field(name="⚡ Bot Latency", value=f"`{ws_latency} ms`", inline=True)
+    if render_url:
+        embed.add_field(name="🌐 Render Response", value=f"`{http_status}` ({http_time})", inline=True)
+
+    embed.set_footer(text="BillShock ⚡ • Meralco Utility Bot")
+    await interaction.response.send_message(embed=embed)
+
+
+async def send_help_embed(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="⚡ BillShock Bot • Command Directory",
+        description="Here is the full directory of available commands & AI features in **BillShock**:",
+        color=COLOR_CYAN
+    )
+
+    embed.add_field(
+        name="🤖 AI Assistant & Chatbot",
+        value="• `/ask <question>` — Ask BillShock AI anything about Meralco rates, appliance power, or energy saving.\n"
+              "• `@BillShock <question>` — Mention the bot directly in any message to ask a question.\n"
+              "*(Tip: The AI automatically fetches historical rates when you ask about past dates like 'May 2025')*",
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚡ Meralco Rates & Historical Data",
+        value="• `/rates` — View the latest official Meralco residential rates per bracket & MoM trend.\n"
+              "• `/historical_rates <month> <year>` — Look up official rates for any past month (e.g. May 2025).\n"
+              "• `/update_rates` — Force update the cached Meralco rate bulletin PDF.",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🧮 Bill & Appliance Calculators",
+        value="• `/calculate <appliance> <hours_per_day> [days]` — Estimate daily & monthly cost to run an appliance.\n"
+              "• `/total_bill <kwh> [gen_rate] [other_charges]` — Compute full itemized Meralco bill breakdown.\n"
+              "• `/generation_charge <kwh>` — Calculate the base generation charge component for a consumption amount.\n"
+              "• `/bracket <kwh>` — Set your household default monthly consumption bracket (default: 200 kWh).",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🔌 Appliance Database",
+        value="• `/appliances` — List typical Philippine household appliances and wattages by category.\n"
+              "• `/wattage <query>` — Search wattage ranges and descriptions for specific appliances.",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🛠️ System & Status",
+        value="• `/ping` — Check bot WebSocket latency and system status.\n"
+              "• `/help` — Display this command directory.",
+        inline=False
+    )
+
+    embed.set_footer(text="BillShock ⚡ • Meralco Rates, Appliance Estimator & AI Assistant")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="help", description="Display a complete directory of all available bot commands and features.")
+@is_allowed_channel()
+async def help_command(interaction: discord.Interaction):
+    await send_help_embed(interaction)
+
+
+@bot.tree.command(name="commands", description="Display a complete directory of all available bot commands and features.")
+@is_allowed_channel()
+async def commands_command(interaction: discord.Interaction):
+    await send_help_embed(interaction)
+
+
+
+
 
 
 # ==============================================================================
