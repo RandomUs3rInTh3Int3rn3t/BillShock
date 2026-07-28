@@ -146,13 +146,13 @@ async def ask_gemini_chatbot(user_query: str) -> str:
 
     import google.generativeai as genai
 
-    # Token-optimized generation config: lower max tokens = less quota usage
+    # Generation config with 1024 max output tokens to prevent cut-offs mid-sentence
     gen_config = genai.types.GenerationConfig(
-        max_output_tokens=512,
-        temperature=0.7,
+        max_output_tokens=1024,
+        temperature=0.5,
     )
 
-    fallback_models = [selected_model_name, "gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-flash-latest", "gemini-3.6-flash", "gemini-pro-latest"]
+    fallback_models = [selected_model_name, "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-flash-latest", "gemini-3.6-flash"]
     
     last_error = None
     for model_name in dict.fromkeys(fallback_models):
@@ -161,16 +161,28 @@ async def ask_gemini_chatbot(user_query: str) -> str:
             response = await asyncio.to_thread(
                 model.generate_content, full_prompt, generation_config=gen_config
             )
-            text = response.text.strip()
+            text = (response.text or "").strip()
+            if not text:
+                continue
+
+            # Sanitize any dangling incomplete markdown lines at the end (e.g. "• **")
+            lines = text.split("\n")
+            while lines and (lines[-1].strip() in ["•", "• **", "**", "-"] or lines[-1].strip().endswith("**")):
+                lines.pop()
+            text = "\n".join(lines).strip()
+
             if len(text) > 1900:
                 text = text[:1900] + "...\n*(truncated)*"
-            return text
+            
+            if text:
+                return text
         except Exception as e:
             last_error = e
             logger.warning(f"Gemini model {model_name} failed: {e}. Trying next...")
 
     logger.error(f"All Gemini models failed: {last_error}")
-    return "⚠️ AI Assistant is temporarily unavailable. Please try again in a moment, or use `/rates` and `/calculate` for quick lookups!"
+    return "⚠️ AI Assistant is temporarily busy or rate-limited. Please try again in a few seconds, or use `/rates` and `/calculate` for quick lookups!"
+
 
 
 # Channel limitation check
