@@ -196,7 +196,17 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         except Exception:
             pass
 
+@bot.event
+async def on_ready():
+    logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    try:
+        synced = await bot.tree.sync()
+        logger.info(f"Successfully synced {len(synced)} slash commands across all servers: {[cmd.name for cmd in synced]}")
+    except Exception as e:
+        logger.error(f"Failed to sync slash commands: {e}")
+
 # File paths
+
 APPLIANCE_DB_PATH = os.path.join(os.path.dirname(__file__), "appliance_db.json")
 PREFERENCES_PATH = os.path.join(os.path.dirname(__file__), "user_preferences.json")
 
