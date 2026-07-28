@@ -87,13 +87,13 @@ def get_system_context() -> str:
         "2. You must NEVER write, generate, or provide any programming code, HTML, CSS, JavaScript, Python, or any other code in any language. If asked to write code, politely decline.",
         "3. You must NEVER help with topics unrelated to electricity such as: coding, homework, math (unless bill calculation), recipes, games, general knowledge, or anything outside your electricity scope.",
         "4. If a user asks an off-topic question, respond: 'I'm BillShock AI ⚡ — I can only help with Meralco rates, electricity bills, appliance power usage, and energy-saving tips! Try /rates or /calculate for quick lookups.'",
-        "5. Keep answers SHORT and concise (under 300 words). Use bullet points. Do not over-explain.",
+        "5. Provide complete, well-structured, helpful answers using bullet points and clean Discord markdown.",
         "6. Use Philippine Peso (₱) for all currency values.",
-        "7. Format answers with Discord markdown: **bold**, bullet points, `inline code` for numbers.",
+        "7. Format numbers with `inline code` (e.g. `₱15.1869/kWh`, `1000W`).",
         "=== END RULES ==="
     ]
     
-    # Inject condensed rate data (only key brackets to save tokens)
+    # Inject condensed rate data
     if os.path.exists(RATES_JSON_PATH):
         try:
             with open(RATES_JSON_PATH, "r", encoding="utf-8") as f:
@@ -102,7 +102,6 @@ def get_system_context() -> str:
                     context_lines.append("\n[Meralco Rates]")
                     if rates_data.get("date"):
                         context_lines.append(f"Period: {rates_data['date']}")
-                    # Only include key brackets (50, 200, 500, 1000) to save tokens
                     key_brackets = {50, 100, 200, 300, 500, 1000}
                     for entry in rates_data["data"]:
                         if entry["kwh"] in key_brackets:
@@ -112,7 +111,7 @@ def get_system_context() -> str:
         except Exception:
             pass
 
-    # Inject condensed appliance data (fewer entries to save tokens)
+    # Inject condensed appliance data
     appliance_db_path = os.path.join(os.path.dirname(__file__), "appliance_db.json")
     if os.path.exists(appliance_db_path):
         try:
@@ -134,7 +133,7 @@ def get_system_context() -> str:
 
 
 async def ask_gemini_chatbot(user_query: str) -> str:
-    """Send prompt to Gemini AI with guardrails, token optimization, and model fallback."""
+    """Send prompt to Gemini AI without token limiters."""
     if not GEMINI_API_KEY:
         return (
             "⚠️ **AI Assistant Offline**\n"
@@ -142,15 +141,9 @@ async def ask_gemini_chatbot(user_query: str) -> str:
         )
 
     system_context = get_system_context()
-    full_prompt = f"{system_context}\n\nUser: {user_query}\n\nAnswer (concise, electricity-only):"
+    full_prompt = f"{system_context}\n\nUser: {user_query}\n\nAnswer:"
 
     import google.generativeai as genai
-
-    # Generation config with 1024 max output tokens to prevent cut-offs mid-sentence
-    gen_config = genai.types.GenerationConfig(
-        max_output_tokens=1024,
-        temperature=0.5,
-    )
 
     fallback_models = [selected_model_name, "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-flash-latest", "gemini-3.6-flash"]
     
@@ -158,22 +151,16 @@ async def ask_gemini_chatbot(user_query: str) -> str:
     for model_name in dict.fromkeys(fallback_models):
         try:
             model = genai.GenerativeModel(model_name)
-            response = await asyncio.to_thread(
-                model.generate_content, full_prompt, generation_config=gen_config
-            )
+            # Call without max_output_tokens limiter so complete responses are generated
+            response = await asyncio.to_thread(model.generate_content, full_prompt)
             text = (response.text or "").strip()
             if not text:
                 continue
 
-            # Sanitize any dangling incomplete markdown lines at the end (e.g. "• **")
-            lines = text.split("\n")
-            while lines and (lines[-1].strip() in ["•", "• **", "**", "-"] or lines[-1].strip().endswith("**")):
-                lines.pop()
-            text = "\n".join(lines).strip()
-
+            # Sanitize any dangling incomplete markdown lines at the end if truncated by Discord
             if len(text) > 1900:
-                text = text[:1900] + "...\n*(truncated)*"
-            
+                text = text[:1900] + "...\n*(truncated for Discord character limit)*"
+
             if text:
                 return text
         except Exception as e:
@@ -182,6 +169,7 @@ async def ask_gemini_chatbot(user_query: str) -> str:
 
     logger.error(f"All Gemini models failed: {last_error}")
     return "⚠️ AI Assistant is temporarily busy or rate-limited. Please try again in a few seconds, or use `/rates` and `/calculate` for quick lookups!"
+
 
 
 
