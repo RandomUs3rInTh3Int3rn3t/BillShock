@@ -67,30 +67,52 @@ if GEMINI_API_KEY:
         logger.error(f"Error initializing Gemini AI: {e}")
 
 
+# Cache system context to avoid re-reading files on every query
+_cached_system_context = None
+_cached_context_time = 0
 
 def get_system_context() -> str:
-    """Build system context using current rates and appliance database (RAG)."""
+    """Build system context with guardrails and rate/appliance data (cached for 5 min)."""
+    global _cached_system_context, _cached_context_time
+    import time
+    now = time.time()
+    if _cached_system_context and (now - _cached_context_time) < 300:
+        return _cached_system_context
+
     context_lines = [
-        "You are BillShock AI, an expert, friendly assistant for Meralco electricity bills, appliance power usage, and energy-saving advice in the Philippines.",
-        "Use Philippine Peso (₱ / PHP) for currency.",
-        "Provide clear, helpful, concise answers formatted cleanly with Discord markdown (bold, bullet points, code blocks where helpful)."
+        "You are BillShock AI, a specialized assistant ONLY for Philippine electricity topics.",
+        "",
+        "=== STRICT RULES (NEVER VIOLATE) ===",
+        "1. You ONLY answer questions about: Meralco electricity rates, electricity bills, appliance power/wattage, energy consumption, energy-saving tips, and Philippine electricity topics.",
+        "2. You must NEVER write, generate, or provide any programming code, HTML, CSS, JavaScript, Python, or any other code in any language. If asked to write code, politely decline.",
+        "3. You must NEVER help with topics unrelated to electricity such as: coding, homework, math (unless bill calculation), recipes, games, general knowledge, or anything outside your electricity scope.",
+        "4. If a user asks an off-topic question, respond: 'I'm BillShock AI ⚡ — I can only help with Meralco rates, electricity bills, appliance power usage, and energy-saving tips! Try /rates or /calculate for quick lookups.'",
+        "5. Keep answers SHORT and concise (under 300 words). Use bullet points. Do not over-explain.",
+        "6. Use Philippine Peso (₱) for all currency values.",
+        "7. Format answers with Discord markdown: **bold**, bullet points, `inline code` for numbers.",
+        "=== END RULES ==="
     ]
     
+    # Inject condensed rate data (only key brackets to save tokens)
     if os.path.exists(RATES_JSON_PATH):
         try:
             with open(RATES_JSON_PATH, "r", encoding="utf-8") as f:
                 rates_data = json.load(f)
                 if rates_data.get("success") and rates_data.get("data"):
-                    context_lines.append("\n--- Live Meralco Rates Data ---")
+                    context_lines.append("\n[Meralco Rates]")
                     if rates_data.get("date"):
-                        context_lines.append(f"Billing Period: {rates_data['date']}")
+                        context_lines.append(f"Period: {rates_data['date']}")
+                    # Only include key brackets (50, 200, 500, 1000) to save tokens
+                    key_brackets = {50, 100, 200, 300, 500, 1000}
                     for entry in rates_data["data"]:
-                        context_lines.append(
-                            f"- {entry['kwh']} kWh bracket: ₱{entry['rate']:.4f}/kWh (Generation: ₱{entry['generation_rate']:.4f}/kWh)"
-                        )
+                        if entry["kwh"] in key_brackets:
+                            context_lines.append(
+                                f"{entry['kwh']}kWh: ₱{entry['rate']:.4f}/kWh (gen: ₱{entry['generation_rate']:.4f})"
+                            )
         except Exception:
             pass
 
+    # Inject condensed appliance data (fewer entries to save tokens)
     appliance_db_path = os.path.join(os.path.dirname(__file__), "appliance_db.json")
     if os.path.exists(appliance_db_path):
         try:
@@ -98,18 +120,21 @@ def get_system_context() -> str:
                 app_data = json.load(f)
                 appliances = app_data.get("appliances", [])
                 if appliances:
-                    context_lines.append("\n--- Appliance Wattages Database (Sample) ---")
-                    for app in appliances[:15]:
+                    context_lines.append("\n[Appliances]")
+                    for app in appliances[:10]:
                         context_lines.append(
-                            f"- {app['name']}: ~{app['average_wattage']}W ({app['wattage_range']}) - {app.get('description', '')}"
+                            f"{app['name']}: {app['average_wattage']}W"
                         )
         except Exception:
             pass
 
-    return "\n".join(context_lines)
+    _cached_system_context = "\n".join(context_lines)
+    _cached_context_time = now
+    return _cached_system_context
+
 
 async def ask_gemini_chatbot(user_query: str) -> str:
-    """Send prompt to Gemini AI and return formatted response with model fallback."""
+    """Send prompt to Gemini AI with guardrails, token optimization, and model fallback."""
     if not GEMINI_API_KEY:
         return (
             "⚠️ **AI Assistant Offline**\n"
@@ -117,28 +142,35 @@ async def ask_gemini_chatbot(user_query: str) -> str:
         )
 
     system_context = get_system_context()
-    full_prompt = f"{system_context}\n\nUser Question: {user_query}\n\nAnswer:"
+    full_prompt = f"{system_context}\n\nUser: {user_query}\n\nAnswer (concise, electricity-only):"
 
     import google.generativeai as genai
-    fallback_models = [selected_model_name, "gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-flash-latest", "gemini-3.6-flash", "gemini-pro-latest"]
 
+    # Token-optimized generation config: lower max tokens = less quota usage
+    gen_config = genai.types.GenerationConfig(
+        max_output_tokens=512,
+        temperature=0.7,
+    )
+
+    fallback_models = [selected_model_name, "gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-flash-latest", "gemini-3.6-flash", "gemini-pro-latest"]
     
     last_error = None
-
     for model_name in dict.fromkeys(fallback_models):
         try:
             model = genai.GenerativeModel(model_name)
-            response = await asyncio.to_thread(model.generate_content, full_prompt)
+            response = await asyncio.to_thread(
+                model.generate_content, full_prompt, generation_config=gen_config
+            )
             text = response.text.strip()
             if len(text) > 1900:
-                text = text[:1900] + "...\n*(response truncated due to Discord length limit)*"
+                text = text[:1900] + "...\n*(truncated)*"
             return text
         except Exception as e:
             last_error = e
-            logger.warning(f"Gemini API model {model_name} failed: {e}. Trying next model...")
+            logger.warning(f"Gemini model {model_name} failed: {e}. Trying next...")
 
-    logger.error(f"Gemini API query error across all models: {last_error}")
-    return f"❌ Error contacting AI Assistant: `{str(last_error)}`"
+    logger.error(f"All Gemini models failed: {last_error}")
+    return "⚠️ AI Assistant is temporarily unavailable. Please try again in a moment, or use `/rates` and `/calculate` for quick lookups!"
 
 
 # Channel limitation check
@@ -174,11 +206,18 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 APPLIANCE_DB_PATH = os.path.join(os.path.dirname(__file__), "appliance_db.json")
 PREFERENCES_PATH = os.path.join(os.path.dirname(__file__), "user_preferences.json")
 
-# Colors
-MERALCO_ORANGE = discord.Color.from_rgb(252, 136, 3)
-GREEN = discord.Color.green()
-RED = discord.Color.red()
-GREY = discord.Color.light_grey()
+# Sleek Color Palette
+COLOR_ORANGE = discord.Color.from_rgb(255, 102, 0)   # Meralco Electric Amber
+COLOR_BLUE = discord.Color.from_rgb(0, 136, 255)     # AI Assistant Electric Blue
+COLOR_GREEN = discord.Color.from_rgb(0, 200, 83)     # Success Green
+COLOR_CYAN = discord.Color.from_rgb(0, 229, 255)     # Info & Appliance Cyan
+COLOR_RED = discord.Color.from_rgb(255, 61, 0)       # Warning / Alert Red
+
+MERALCO_ORANGE = COLOR_ORANGE
+GREEN = COLOR_GREEN
+RED = COLOR_RED
+GREY = discord.Color.from_rgb(47, 49, 54)
+
 
 # Helper Functions
 def load_appliance_db() -> dict:
@@ -410,10 +449,10 @@ async def rates(interaction: discord.Interaction):
     source_url = rates_info.get("meta", {}).get("source", "https://www.meralco.com.ph")
 
     embed = discord.Embed(
-        title=f"⚡ Meralco Residential Rates ({billing_date})",
-        description="Showing electricity rates per consumption bracket (VAT-exclusive).",
+        title=f"⚡ Meralco Residential Rates — {billing_date}",
+        description="Official residential electricity rates per consumption bracket (VAT-exclusive).",
         url=source_url,
-        color=MERALCO_ORANGE
+        color=COLOR_ORANGE
     )
 
     # Let's add the 200 kWh (typical household) rate as the main highlight
@@ -423,11 +462,13 @@ async def rates(interaction: discord.Interaction):
 
     if typical_entry:
         trend_emoji = "📈" if typical_entry["trend"] == "up" else "📉" if typical_entry["trend"] == "down" else "➡️"
-        change_text = f"{typical_entry['rate_change']:+g} PHP/kWh ({typical_entry['rate_change_percent']}% change)" if typical_entry['rate_change'] else "No change"
+        change_text = f"`{typical_entry['rate_change']:+g}` PHP/kWh ({typical_entry['rate_change_percent']}% MoM)" if typical_entry['rate_change'] else "No change"
         
         embed.add_field(
-            name="💡 Typical Household (200 kWh)",
-            value=f"**Rate:** `₱{typical_entry['rate']:.4f}` per kWh\n**MoM Trend:** {trend_emoji} {change_text}",
+            name="💡 Baseline Household Bracket (200 kWh)",
+            value=f"• **Effective Rate:** `₱{typical_entry['rate']:.4f} / kWh`\n"
+                  f"• **Gen Rate:** `₱{typical_entry['generation_rate']:.4f} / kWh`\n"
+                  f"• **Monthly Trend:** {trend_emoji} {change_text}",
             inline=False
         )
 
@@ -436,8 +477,8 @@ async def rates(interaction: discord.Interaction):
     other_brackets_text = []
     for entry in data_list:
         if entry["kwh"] in brackets_to_show:
-            trend_icon = "🔺" if entry["trend"] == "up" else "🔻" if entry["trend"] == "down" else "🔸"
-            other_brackets_text.append(f"• **{entry['kwh']} kWh:** `₱{entry['rate']:.4f}/kWh` ({trend_icon})")
+            trend_icon = "🔺" if entry["trend"] == "up" else "🔻" if entry["trend"] == "down" else "🔹"
+            other_brackets_text.append(f"• **{entry['kwh']} kWh:** `₱{entry['rate']:.4f}/kWh` {trend_icon}")
     
     if other_brackets_text:
         embed.add_field(
@@ -446,7 +487,8 @@ async def rates(interaction: discord.Interaction):
             inline=False
         )
 
-    embed.set_footer(text="Rates parsed from official Meralco bulletins. Estimates only.")
+    embed.set_footer(text="BillShock ⚡ • Rates parsed from official Meralco bulletins")
+
     
     if rates_info.get("warning"):
         embed.add_field(name="⚠️ Note", value=rates_info["warning"], inline=False)
@@ -849,11 +891,11 @@ async def ask_command(interaction: discord.Interaction, question: str):
     response_text = await ask_gemini_chatbot(question)
 
     embed = discord.Embed(
-        title="🤖 BillShock AI Assistant",
+        title="⚡ BillShock AI • Electricity Assistant",
         description=response_text,
-        color=MERALCO_ORANGE
+        color=COLOR_BLUE
     )
-    embed.set_footer(text="Ask me anything using /ask <question> or by @mentioning me!")
+    embed.set_footer(text="BillShock AI ⚡ • Ask questions via /ask or @mention")
     await interaction.followup.send(embed=embed)
 
 
@@ -876,15 +918,28 @@ async def on_message(message: discord.Message):
         # Strip out the mention tag to get pure query text
         clean_text = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
         if not clean_text:
-            await message.reply("Hello! 👋 I'm **BillShock AI**. Ask me anything about Meralco rates, appliance costs, or energy saving tips!")
+            embed = discord.Embed(
+                title="⚡ BillShock AI • Electricity Assistant",
+                description="Hello! 👋 I'm **BillShock AI**. Ask me anything about Meralco rates, appliance power usage, or energy saving tips!",
+                color=COLOR_BLUE
+            )
+            embed.set_footer(text="BillShock ⚡ • Type /ask or @mention me with your question!")
+            await message.reply(embed=embed)
             return
 
         async with message.channel.typing():
             ai_reply = await ask_gemini_chatbot(clean_text)
             
-        await message.reply(ai_reply)
+        embed = discord.Embed(
+            title="⚡ BillShock AI • Electricity Assistant",
+            description=ai_reply,
+            color=COLOR_BLUE
+        )
+        embed.set_footer(text="BillShock AI ⚡ • Ask questions via /ask or @mention")
+        await message.reply(embed=embed)
 
     await bot.process_commands(message)
+
 
 
 
